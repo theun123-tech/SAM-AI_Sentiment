@@ -1,0 +1,37 @@
+# Secrets & credentials
+.env
+.env.*
+.env.local
+settings.json
+
+# Runtime / generated data
+sessions.json
+standups.json
+session_insights.json
+meeting_setups.json
+conversation_summaries.json
+pending_tickets.json
+agenda_templates.json
+checkpoints.db
+nlu_debug.txt
+serpapi_debug/
+transcripts/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Logs & temp
+*.log
+*.tmp
+
+# Claude Code
+.claude/
