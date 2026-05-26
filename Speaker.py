@@ -93,7 +93,7 @@ def get_duration_ms(audio_bytes: bytes) -> int:
 RECALL_REGION   = os.environ.get("RECALLAI_REGION", "ap-northeast-1")
 RECALL_API_BASE = f"https://{RECALL_REGION}.recall.ai/api/v1"
 
-CARTESIA_VOICE_ID = "faf0731e-dfb9-4cfc-8119-259a79b27e12"
+CARTESIA_VOICE_ID = "7789cdfd-f938-4c53-8078-03f1a89d243b"
 CARTESIA_MODEL    = "sonic-3.5"
 CARTESIA_WS_URL   = "wss://api.cartesia.ai/tts/websocket"
 

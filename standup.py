@@ -18,12 +18,139 @@ User never waits for Azure. Entire conversation is Groq-speed.
 """
 
 import asyncio
+import functools
+import inspect
+import sys
 import time
 import re
 import json
 import os
 from enum import Enum, auto
 from typing import Optional
+
+# ── Debug tracing (STANDUP_DEBUG=1 default on; STANDUP_DEBUG_LINES=1 per-line) ──
+_STANDUP_DEBUG = os.environ.get("STANDUP_DEBUG", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_STANDUP_DEBUG_LINES = os.environ.get("STANDUP_DEBUG_LINES", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_STANDUP_THIS_FILE = os.path.normpath(__file__)
+_LINE_TRACE_DEPTH = 0
+_LINE_TRACE_HOT = frozenset(
+    {
+        "handle",
+        "_handle_warm_up",
+        "_handle_question",
+        "_handle_confirmation",
+        "_speak_summary",
+        "background_finalize",
+        "_silence_reprompt",
+        "_apply_correction",
+        "_apply_copies_previous",
+    }
+)
+
+
+def _standup_format_kv(**kw) -> str:
+    if not kw:
+        return ""
+    parts = []
+    for k, v in kw.items():
+        s = str(v)
+        if len(s) > 120:
+            s = s[:117] + "..."
+        parts.append(f"{k}={s!r}")
+    return " | " + " ".join(parts)
+
+
+def _standup_dbg_print(tag: str, loc: str, state_name: str = "?", **kw):
+    if not _STANDUP_DEBUG:
+        return
+    print(f"[Standup][DBG][{tag}][{state_name}] {loc}{_standup_format_kv(**kw)}")
+
+
+def _line_tracer(frame, event, arg):
+    global _LINE_TRACE_DEPTH
+    fn = os.path.normpath(frame.f_code.co_filename)
+    if fn != _STANDUP_THIS_FILE:
+        return _line_tracer
+    if event == "call":
+        _LINE_TRACE_DEPTH += 1
+        return _line_tracer
+    if event == "return":
+        _LINE_TRACE_DEPTH = max(0, _LINE_TRACE_DEPTH - 1)
+        return _line_tracer
+    if event != "line" or not _STANDUP_DEBUG_LINES or _LINE_TRACE_DEPTH <= 0:
+        return _line_tracer
+    print(f"[Standup][LINE] {frame.f_code.co_name}:{frame.f_lineno}")
+    return _line_tracer
+
+
+def _standup_line_trace_enter(method_name: str):
+    if _STANDUP_DEBUG_LINES and method_name in _LINE_TRACE_HOT:
+        sys.settrace(_line_tracer)
+
+
+def _standup_line_trace_exit(method_name: str):
+    if _STANDUP_DEBUG_LINES and method_name in _LINE_TRACE_HOT:
+        sys.settrace(None)
+
+
+def _trace_standup_method(name: str, func):
+    if inspect.iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def async_wrapper(self, *args, **kwargs):
+            st = getattr(getattr(self, "state", None), "name", "?")
+            _standup_dbg_print("ENTER", name, st, args=args, kwargs=kwargs)
+            _standup_line_trace_enter(name)
+            try:
+                result = await func(self, *args, **kwargs)
+                _standup_dbg_print("EXIT", name, st, result=result)
+                return result
+            except Exception as e:
+                _standup_dbg_print(
+                    "RAISE", name, st, error=type(e).__name__, msg=str(e)
+                )
+                raise
+            finally:
+                _standup_line_trace_exit(name)
+
+        return async_wrapper
+
+    @functools.wraps(func)
+    def sync_wrapper(self, *args, **kwargs):
+        st = getattr(getattr(self, "state", None), "name", "?")
+        _standup_dbg_print("ENTER", name, st, args=args, kwargs=kwargs)
+        try:
+            result = func(self, *args, **kwargs)
+            _standup_dbg_print("EXIT", name, st, result=result)
+            return result
+        except Exception as e:
+            _standup_dbg_print("RAISE", name, st, error=type(e).__name__, msg=str(e))
+            raise
+
+    return sync_wrapper
+
+
+def _install_standup_tracing(cls):
+    if not _STANDUP_DEBUG:
+        return cls
+    for attr_name, attr in list(vars(cls).items()):
+        if attr_name.startswith("__") and attr_name != "__init__":
+            continue
+        if isinstance(attr, (staticmethod, classmethod, property)):
+            continue
+        if callable(attr):
+            setattr(cls, attr_name, _trace_standup_method(attr_name, attr))
+    return cls
 
 
 class StandupState(Enum):
@@ -135,6 +262,129 @@ RULES:
 - For blockers: if "no blockers" or "none" → "Blockers: None."
 - For blockers: if ANY issue, delay, problem described → MUST include it. NEVER write "None" when a blocker was described.
 - Total MUST be under 30 words before the confirmation question."""
+
+_SUMMARY_STYLES = [
+    """Create a BRIEF spoken summary in a direct, professional tone from the developer's answers.
+
+What they said:
+  Yesterday: "{yesterday}"
+  Today: "{today}"
+  Blockers: "{blockers}"
+
+Fill in this EXACT template:
+"Yesterday: [phrase]. Today: [phrase]. Blockers: [phrase]. Sound right, or anything to change?"
+
+RULES:
+- Use the EXACT template with all three sections.
+- Each phrase must be under 10 words.
+- Fix speech-to-text errors. Convert garbled words to proper ticket IDs.
+- If the raw text is unclear or garbled, preserve the developer's original words as closely as possible. NEVER invent or hallucinate content that wasn't said.
+- For blockers: if "no blockers" or "none" → "Blockers: None."
+- For blockers: if ANY issue, delay, problem described → MUST include it. NEVER write "None" when a blocker was described.
+- Total MUST be under 30 words before the confirmation question.""",
+    """Create a BRIEF spoken summary in a warm, conversational tone from the developer's answers.
+
+What they said:
+  Yesterday: "{yesterday}"
+  Today: "{today}"
+  Blockers: "{blockers}"
+
+Fill in this EXACT template:
+"Yesterday: [phrase]. Today: [phrase]. Blockers: [phrase]. Sound right, or anything to change?"
+
+RULES:
+- Use the EXACT template with all three sections.
+- Each phrase must be under 10 words.
+- Fix speech-to-text errors. Convert garbled words to proper ticket IDs.
+- If the raw text is unclear or garbled, preserve the developer's original words as closely as possible. NEVER invent or hallucinate content that wasn't said.
+- For blockers: if "no blockers" or "none" → "Blockers: None."
+- For blockers: if ANY issue, delay, problem described → MUST include it. NEVER write "None" when a blocker was described.
+- Total MUST be under 30 words before the confirmation question.""",
+    """Create a BRIEF spoken summary in a concise, matter-of-fact tone from the developer's answers.
+
+What they said:
+  Yesterday: "{yesterday}"
+  Today: "{today}"
+  Blockers: "{blockers}"
+
+Fill in this EXACT template:
+"Yesterday: [phrase]. Today: [phrase]. Blockers: [phrase]. Sound right, or anything to change?"
+
+RULES:
+- Use the EXACT template with all three sections.
+- Each phrase must be under 10 words.
+- Fix speech-to-text errors. Convert garbled words to proper ticket IDs.
+- If the raw text is unclear or garbled, preserve the developer's original words as closely as possible. NEVER invent or hallucinate content that wasn't said.
+- For blockers: if "no blockers" or "none" → "Blockers: None."
+- For blockers: if ANY issue, delay, problem described → MUST include it. NEVER write "None" when a blocker was described.
+- Total MUST be under 30 words before the confirmation question.""",
+    """Create a BRIEF spoken summary in an upbeat, encouraging tone from the developer's answers.
+
+What they said:
+  Yesterday: "{yesterday}"
+  Today: "{today}"
+  Blockers: "{blockers}"
+
+Fill in this EXACT template:
+"Yesterday: [phrase]. Today: [phrase]. Blockers: [phrase]. Sound right, or anything to change?"
+
+RULES:
+- Use the EXACT template with all three sections.
+- Each phrase must be under 10 words.
+- Fix speech-to-text errors. Convert garbled words to proper ticket IDs.
+- If the raw text is unclear or garbled, preserve the developer's original words as closely as possible. NEVER invent or hallucinate content that wasn't said.
+- For blockers: if "no blockers" or "none" → "Blockers: None."
+- For blockers: if ANY issue, delay, problem described → MUST include it. NEVER write "None" when a blocker was described.
+- Total MUST be under 30 words before the confirmation question.""",
+    """Create a BRIEF spoken summary in a calm, supportive tone from the developer's answers.
+
+What they said:
+  Yesterday: "{yesterday}"
+  Today: "{today}"
+  Blockers: "{blockers}"
+
+Fill in this EXACT template:
+"Yesterday: [phrase]. Today: [phrase]. Blockers: [phrase]. Sound right, or anything to change?"
+
+RULES:
+- Use the EXACT template with all three sections.
+- Each phrase must be under 10 words.
+- Fix speech-to-text errors. Convert garbled words to proper ticket IDs.
+- If the raw text is unclear or garbled, preserve the developer's original words as closely as possible. NEVER invent or hallucinate content that wasn't said.
+- For blockers: if "no blockers" or "none" → "Blockers: None."
+- For blockers: if ANY issue, delay, problem described → MUST include it. NEVER write "None" when a blocker was described.
+- Total MUST be under 30 words before the confirmation question.""",
+]
+
+_CONFIRMED_CLOSES = [
+    "Perfect. Have a good one, {name}.",
+    "Great — catch you tomorrow, {name}.",
+    "All good. Take care, {name}.",
+    "Done. Have a great rest of your day, {name}.",
+]
+
+_STANDUP_GREETING_OPENERS = {
+    "morning": [
+        "Good morning, {name}! Hope your day's going well — ready for a quick standup?",
+        "Morning, {name}! Ready to run through a quick standup?",
+        "Hey {name}, good morning! Hope you're doing well — shall we do a quick standup?",
+    ],
+    "afternoon": [
+        "Good afternoon, {name}! Hope your day's going well — ready for a quick standup?",
+        "Afternoon, {name}! Ready to run through a quick standup?",
+        "Hey {name}, good afternoon! Hope you're doing well — shall we do a quick standup?",
+    ],
+    "evening": [
+        "Good evening, {name}! Hope your day's going well — ready for a quick standup?",
+        "Evening, {name}! Ready to run through a quick standup?",
+        "Hey {name}, good evening! Hope you're doing well — shall we do a quick standup?",
+    ],
+    "late": [
+        "Hey {name}! Hope your day's going well — ready for a quick standup?",
+        "Hi {name}! Ready to run through a quick standup?",
+        "Hey {name}! Hope you're doing well — shall we do a quick standup?",
+    ],
+}
 
 # Mode B: Handle confirmation/correction
 PHASE2_CONFIRM = """Current standup: Yesterday: "{yesterday}" | Today: "{today}" | Blockers: "{blockers}"
@@ -386,6 +636,16 @@ class StandupFlow:
         self._unclear_state = (
             None  # state where unclears accumulated (for reset detection)
         )
+
+        self._greeting_style_idx = -1
+        self._summary_style_idx = -1
+        self._confirmed_close_idx = -1
+        self._dbg("__init__.done", developer=developer_name, project_key=self._project_key)
+
+    def _dbg(self, loc: str, **kw):
+        """Branch/step debug log. Enabled when STANDUP_DEBUG=1."""
+        st = self.state.name if getattr(self, "state", None) else "?"
+        _standup_dbg_print("BRANCH", loc, st, **kw)
 
     @property
     def is_done(self) -> bool:
@@ -667,31 +927,59 @@ class StandupFlow:
             return "Good evening"
         return "Hey"
 
+    @staticmethod
+    def _time_slot() -> str:
+        hour = time.localtime().tm_hour
+        if 5 <= hour < 12:
+            return "morning"
+        if 12 <= hour < 17:
+            return "afternoon"
+        if 17 <= hour < 21:
+            return "evening"
+        return "late"
+
     async def start(self, gen: int):
+        self._dbg("start.entry", gen=gen)
         self._generation = gen
-        opener = f"{self._time_greeting()} {self.developer}! Hope your day's going well — ready for a quick standup?"
+        slot = self._time_slot()
+        openers = _STANDUP_GREETING_OPENERS[slot]
+        self._greeting_style_idx = (self._greeting_style_idx + 1) % len(openers)
+        opener = openers[self._greeting_style_idx].format(name=self.developer)
+        self._dbg("start.opener", slot=slot, idx=self._greeting_style_idx, opener=opener[:80])
         self._add_history("Sam", opener)
         await self.speak(opener, "standup-greeting", gen)
         self.state = StandupState.WARM_UP
+        self._dbg("start.state_warm_up")
         self._start_silence_timer()
 
     async def handle(
         self, text: str, speaker: str, gen: int, sentiment: Optional[str] = None
     ) -> bool:
+        self._dbg(
+            "handle.entry",
+            text=text[:80],
+            speaker=speaker,
+            gen=gen,
+            sentiment=sentiment,
+            processing=self._processing,
+        )
         self._generation = gen
         self._cancel_silence_timer()
         if speaker.lower() == "sam":
+            self._dbg("handle.skip_sam_speaker")
             return not self.is_done
         self._add_history(speaker, text)
         print(
             f'[Standup] 📥 handle() state={self.state.name} processing={self._processing} text="{text[:60]}" sentiment={sentiment}'
         )
         if self._processing:
+            self._dbg("handle.skip_already_processing")
             print(f"[Standup] ⚠️  handle() SKIPPED — _processing is True")
             return not self.is_done
         self._processing = True
         try:
             if self.state == StandupState.WARM_UP:
+                self._dbg("handle.route_warm_up")
                 print(f"[Standup] 📋 → _handle_warm_up")
                 await self._handle_warm_up(text, gen, sentiment=sentiment)
             elif self.state in (
@@ -699,15 +987,19 @@ class StandupFlow:
                 StandupState.ASK_TODAY,
                 StandupState.ASK_BLOCKERS,
             ):
+                self._dbg("handle.route_question", state=self.state.name)
                 print(f"[Standup] 📋 → _handle_question ({self.state.name})")
                 await self._handle_question(text, gen, sentiment=sentiment)
             elif self.state in (StandupState.CONFIRM, StandupState.SUMMARY):
+                self._dbg("handle.route_confirmation", state=self.state.name)
                 print(f"[Standup] 📋 → _handle_confirmation ({self.state.name})")
                 await self._handle_confirmation(text, gen)
             else:
+                self._dbg("handle.unhandled_state", state=self.state.name)
                 print(f"[Standup] ⚠️  handle() — unhandled state: {self.state.name}")
         finally:
             self._processing = False
+            self._dbg("handle.finally", state=self.state.name, is_done=self.is_done)
             print(
                 f"[Standup] 📤 handle() done — _processing released, state={self.state.name}"
             )
@@ -849,6 +1141,7 @@ class StandupFlow:
     async def _handle_warm_up(
         self, text: str, gen: int, sentiment: Optional[str] = None
     ):
+        self._dbg("_handle_warm_up.entry", text=text[:80], gen=gen, sentiment=sentiment)
         text_lower = text.strip().lower()
         self._warm_up_exchanges += 1
         print(
@@ -857,6 +1150,7 @@ class StandupFlow:
 
         # ── Path A: exchange 2 after Sam asked "how are you" ─────────────────
         if self._warm_up_asked_back:
+            self._dbg("warm_up.path_a_asked_back")
             mood = self._detect_mood(text_lower)
             # Use sentiment from STT as a tiebreaker if text alone is ambiguous
             if mood == "neutral" and sentiment == "negative":
@@ -866,28 +1160,32 @@ class StandupFlow:
             print(f"[Standup] 🌡️  mood detected: {mood} (sentiment={sentiment})")
 
             if mood == "stressed":
+                self._dbg("warm_up.mood_stressed")
                 self._empathy_mode = True
                 r = self._transition_to_standup(
                     f"Sorry to hear that, {self.developer} — let's keep this focused and wrap up quickly for you"
                 )
             elif mood == "tired":
+                self._dbg("warm_up.mood_tired")
                 self._empathy_mode = True
                 r = self._transition_to_standup(
                     "Totally get that — let's make this quick and get you out of here fast"
                 )
             else:
-                # positive or neutral
+                self._dbg("warm_up.mood_positive_or_neutral", mood=mood)
                 r = self._transition_to_standup("Love that!")
 
             self._add_history("Sam", r)
             await self.speak(r, "standup-warmup-mood-transition", gen)
             self.state = StandupState.ASK_YESTERDAY
+            self._dbg("warm_up.path_a_done", new_state=self.state.name)
             self._start_silence_timer()
             return
 
         # ── Path B: ready signal ──────────────────────────────────────────────
         is_ready = any(sig in text_lower for sig in self._READY_SIGNALS)
         if is_ready:
+            self._dbg("warm_up.path_b_ready")
             r = f"Great! Let's do it — what did you work on yesterday, {self.developer}?"
             self._add_history("Sam", r)
             await self.speak(r, "standup-warmup-transition", gen)
@@ -898,6 +1196,7 @@ class StandupFlow:
         # ── Path C: exchange 1 greeting → reciprocal ask-back ────────────────
         is_greeting = any(sig in text_lower for sig in self._GREETING_SIGNALS)
         if is_greeting and self._warm_up_exchanges == 1:
+            self._dbg("warm_up.path_c_greeting")
             tg = self._time_greeting()
             period = {
                 "Good morning": "morning",
@@ -927,6 +1226,7 @@ class StandupFlow:
 
         # ── Path D: exchange cap hit — auto-transition ────────────────────────
         if self._warm_up_exchanges >= 2:
+            self._dbg("warm_up.path_d_exchange_cap")
             r = self._transition_to_standup(
                 f"Good to hear! Let's knock out the standup real quick"
             )
@@ -937,6 +1237,7 @@ class StandupFlow:
             return
 
         # ── Path E: exchange 1 casual (not a greeting, not ready) → LLM reply ─
+        self._dbg("warm_up.path_e_llm_reply")
         WARM_UP_PROMPT = (
             f"You are Sam, an AI PM running a developer standup for {self.developer}. "
             f"You're in the warm-up phase — you just asked if they're ready and they said something casual. "
@@ -964,6 +1265,7 @@ class StandupFlow:
     async def _handle_question(
         self, text: str, gen: int, sentiment: Optional[str] = None
     ):
+        self._dbg("_handle_question.entry", text=text[:80], gen=gen, state=self.state.name)
         topic = self._current_question_label()
         field = {
             StandupState.ASK_YESTERDAY: "yesterday",
@@ -977,6 +1279,7 @@ class StandupFlow:
 
         # Fast path: skip LLM for obvious cases
         if len(words) > 4:
+            self._dbg("question.fast_path_answer", word_count=len(words))
             classification = "ANSWER"
             ack = None  # will get from LLM below
             print(f"[Standup] 📋 Classify: ANSWER (fast — {len(words)} words)")
@@ -993,13 +1296,16 @@ class StandupFlow:
                 "no issues",
             ]
         ):
+            self._dbg("question.fast_path_empty_blockers")
             classification = "EMPTY"
             ack = None
             print(f"[Standup] 📋 Classify: EMPTY (fast — blocker negation)")
         else:
+            self._dbg("question.need_llm_classify")
             classification = None  # need LLM
 
         if classification == "ANSWER" or classification is None:
+            self._dbg("question.llm_classify_block", classification=classification)
             # Use cached EagerEndOfTurn result if available, otherwise call Groq
             try:
                 if self._cached_qa_result and self._cached_qa_text == text:
@@ -1063,7 +1369,9 @@ class StandupFlow:
                 ack = "Got it."
 
         # Handle REDO/STOP
+        self._dbg("question.classification_final", classification=classification, field=field)
         if classification == "REDO":
+            self._dbg("question.branch_redo")
             r = "No problem, let's start over. What did you work on yesterday?"
             self._add_history("Sam", r)
             await self.speak(r, "standup-redo", gen)
@@ -1073,6 +1381,7 @@ class StandupFlow:
             return
 
         if classification == "STOP":
+            self._dbg("question.branch_stop")
             r = "Okay, standup cancelled. Let me know if you want to do it later."
             self._add_history("Sam", r)
             await self.speak(r, "standup-stop", gen)
@@ -1080,6 +1389,7 @@ class StandupFlow:
             return
 
         if classification == "FILLER":
+            self._dbg("question.branch_filler")
             reprompts = {
                 "yesterday": "Sorry, I didn't catch that. What tasks or tickets did you work on yesterday?",
                 "today": "Sorry, could you repeat that? What are you planning to work on today?",
@@ -1092,7 +1402,7 @@ class StandupFlow:
             return
 
         if classification == "GREETING":
-            # Acknowledge warmly, then re-ask the current question
+            self._dbg("question.branch_greeting")
             question_reprompt = {
                 "yesterday": "what did you work on yesterday?",
                 "today": "what are you planning for today?",
@@ -1106,6 +1416,7 @@ class StandupFlow:
             return
 
         if classification == "TECHNICAL_CHECK":
+            self._dbg("question.branch_technical_check")
             question_reprompt = {
                 "yesterday": "what did you work on yesterday?",
                 "today": "what are you planning for today?",
@@ -1118,6 +1429,7 @@ class StandupFlow:
             return
 
         if classification == "OUT_OF_CONTEXT":
+            self._dbg("question.branch_out_of_context")
             redirect = {
                 "yesterday": "Let's stay focused on the standup for now — what did you work on yesterday?",
                 "today": "Let's stick with the standup for now — what are you planning for today?",
@@ -1130,10 +1442,12 @@ class StandupFlow:
             return
 
         if classification == "UNCLEAR":
+            self._dbg("question.branch_unclear")
             attempt = self._track_unclear()
             print(f"[Standup] ❓ UNCLEAR ({field}, attempt {attempt}/2)")
 
             if attempt == 1:
+                self._dbg("question.unclear_attempt_1")
                 # 1st clarification — gentle, warm
                 clarify = {
                     "yesterday": "Sorry, I didn't quite catch that. Could you tell me what you worked on yesterday?",
@@ -1147,7 +1461,7 @@ class StandupFlow:
                 return
 
             elif attempt == 2:
-                # 2nd clarification — more explicit options
+                self._dbg("question.unclear_attempt_2")
                 clarify = {
                     "yesterday": "No worries — just briefly, what was yesterday's work? Even a short summary is fine.",
                     "today": "No worries — what's on your plate today? Even a rough idea works.",
@@ -1160,21 +1474,21 @@ class StandupFlow:
                 return
 
             else:
-                # 3rd UNCLEAR — fallback: save what we have and advance
+                self._dbg("question.unclear_attempt_3_fallback")
                 print(
                     f"[Standup] ⚠️  UNCLEAR max attempts reached — saving last input and advancing"
                 )
                 self.data[field]["raw"] = text if text.strip() else "(not provided)"
                 self._reset_unclear()
                 response = "I'll note that down and move on."
-                # Fall through to state advancement below
 
         else:
-            # Any non-UNCLEAR classification resets the counter
+            self._dbg("question.branch_non_unclear_reset_counter")
             self._reset_unclear()
 
         # Store raw answer
         if classification == "COPIES_PREVIOUS":
+            self._dbg("question.store_copies_previous", field=field)
             copied = False
             if field == "yesterday" and self._previous_standup:
                 # Copy from previous standup's TODAY (their plan = what they actually did)
@@ -1249,61 +1563,71 @@ class StandupFlow:
                 return
 
         elif classification == "EMPTY" and field == "blockers":
+            self._dbg("question.store_empty_blockers")
             self.data["blockers"]["raw"] = "No blockers"
             response = "All clear, no blockers."
         elif classification == "UNCLEAR":
-            # UNCLEAR fallback already set data and response above — don't overwrite
+            self._dbg("question.store_unclear_passthrough")
             pass
         else:
+            self._dbg("question.store_answer", field=field)
             self.data[field]["raw"] = text
             response = ack if ack else "Got it."
 
         # Advance state — soften next question when empathy mode is active
         _soft = "No rush — " if self._empathy_mode else ""
         if self.state == StandupState.ASK_YESTERDAY:
+            self._dbg("question.advance_to_today")
             response += f" {_soft}what's on your plate for today?"
             self._add_history("Sam", response)
             await self.speak(response, "standup-ack-yesterday", gen)
             self.state = StandupState.ASK_TODAY
         elif self.state == StandupState.ASK_TODAY:
+            self._dbg("question.advance_to_blockers")
             response += f" {_soft}any blockers?"
             self._add_history("Sam", response)
             await self.speak(response, "standup-ack-today", gen)
             self.state = StandupState.ASK_BLOCKERS
         elif self.state == StandupState.ASK_BLOCKERS:
+            self._dbg("question.advance_to_summary")
             self._add_history("Sam", response)
             await self.speak(response, "standup-ack-blockers", gen)
-            # Set CONFIRM state BEFORE summary — if user interrupts during summary,
-            # their text should be handled as a confirmation/correction
             self.state = StandupState.CONFIRM
             await self._speak_summary(gen)
 
+        self._dbg("question.done", state=self.state.name)
         self._start_silence_timer()
 
     # ── Summary (Groq, from raw answers — fast) ──────────────────────────────
 
     async def _speak_summary(self, gen: int):
+        self._dbg("_speak_summary.entry", gen=gen)
         yesterday = self.data["yesterday"]["raw"] or "(no answer)"
         today = self.data["today"]["raw"] or "(no answer)"
         blockers = self.data["blockers"]["raw"] or "No blockers"
 
+        self._summary_style_idx = (self._summary_style_idx + 1) % len(_SUMMARY_STYLES)
+        self._dbg("_speak_summary.style", style_idx=self._summary_style_idx)
+        style_prompt = _SUMMARY_STYLES[self._summary_style_idx].format(
+            yesterday=yesterday, today=today, blockers=blockers
+        )
         try:
             summary = await self._groq(
                 PHASE2_PROMPT.format(
                     developer=self.developer,
-                    instructions=PHASE2_SUMMARIZE.format(
-                        yesterday=yesterday, today=today, blockers=blockers
-                    ),
+                    instructions=style_prompt,
                 ),
                 "Summarize standup",
                 max_tokens=60,
             )
-        except Exception:
+        except Exception as e:
+            self._dbg("_speak_summary.groq_fallback", error=type(e).__name__)
             summary = (
                 f"Yesterday: {yesterday}. Today: {today}. {blockers}. Sound right?"
             )
 
         self._confirmed_summary = summary
+        self._dbg("_speak_summary.done", summary=summary[:100])
         print(
             f"[Standup] 📋 Clean summary saved for extraction ({len(summary.split())} words)"
         )
@@ -1314,6 +1638,7 @@ class StandupFlow:
     # ── Confirmation ──────────────────────────────────────────────────────────
 
     async def _handle_confirmation(self, text: str, gen: int):
+        self._dbg("_handle_confirmation.entry", text=text[:80], gen=gen)
         yesterday = self.data["yesterday"]["raw"]
         today = self.data["today"]["raw"]
         blockers = self.data["blockers"]["raw"] or "No blockers"
@@ -1387,12 +1712,15 @@ class StandupFlow:
                 matched = "COPIES_PREVIOUS_YESTERDAY"  # safe default
             # Default to UNCLEAR — safer than guessing CONFIRMED (which would silently save bad data)
             intent = matched or "UNCLEAR"
+            self._dbg("confirm.intent_parsed", intent=intent, matched=matched)
             print(f"[Standup] 🔍 Confirm intent: {intent}")
         except Exception as e:
+            self._dbg("confirm.llm_failed", error=str(e))
             print(f"[Standup] ⚠️  Confirm LLM failed: {e} — defaulting UNCLEAR")
             intent = "UNCLEAR"
 
         if intent == "UNCLEAR":
+            self._dbg("confirm.branch_unclear")
             attempt = self._track_unclear()
             print(f"[Standup] ❓ UNCLEAR (CONFIRM, attempt {attempt}/2)")
 
@@ -1435,7 +1763,13 @@ class StandupFlow:
         self._reset_unclear()
 
         if intent == "CONFIRMED":
-            r = f"That was a great standup, {self.developer}! Have a wonderful rest of your day."
+            self._dbg("confirm.branch_confirmed")
+            self._confirmed_close_idx = (self._confirmed_close_idx + 1) % len(
+                _CONFIRMED_CLOSES
+            )
+            r = _CONFIRMED_CLOSES[self._confirmed_close_idx].format(
+                name=self.developer
+            )
             self._add_history("Sam", r)
             await self.speak(r, "standup-confirmed", gen)
             self.data["completed"] = True
@@ -1446,6 +1780,7 @@ class StandupFlow:
             print(f"[Standup] ✅ {self.developer}'s standup confirmed")
 
         elif intent == "REDO":
+            self._dbg("confirm.branch_redo")
             r = "No problem, let's start over. What did you work on yesterday?"
             self._add_history("Sam", r)
             await self.speak(r, "standup-redo", gen)
@@ -1454,6 +1789,7 @@ class StandupFlow:
             self._start_silence_timer()
 
         elif intent == "REPEAT":
+            self._dbg("confirm.branch_repeat")
             r = "Sure, let me repeat that."
             self._add_history("Sam", r)
             await self.speak(r, "standup-repeat-ack", gen)
@@ -1462,18 +1798,21 @@ class StandupFlow:
             self._start_silence_timer()
 
         elif intent == "GUIDE_CHANGE":
-            r = "Sure, what would you like to change?"
+            self._dbg("confirm.branch_guide_change")
+            r = "Go ahead."
             self._add_history("Sam", r)
             await self.speak(r, "standup-guide", gen)
             self._start_silence_timer()
 
         elif intent == "OUT_OF_CONTEXT":
+            self._dbg("confirm.branch_out_of_context")
             r = "I can help with that after the standup. Does the summary look right, or anything to change?"
             self._add_history("Sam", r)
             await self.speak(r, "standup-out-of-context", gen)
             self._start_silence_timer()
 
         elif "COPIES_PREVIOUS" in intent:
+            self._dbg("confirm.branch_copies_previous", intent=intent)
             field = {
                 "COPIES_PREVIOUS_YESTERDAY": "yesterday",
                 "COPIES_PREVIOUS_TODAY": "today",
@@ -1482,21 +1821,26 @@ class StandupFlow:
             if field:
                 await self._apply_copies_previous(field, gen)
             else:
+                self._dbg("confirm.copies_previous_no_field")
                 r = "Sure, what would you like to copy from last time?"
                 self._add_history("Sam", r)
                 await self.speak(r, "standup-unclear-copy", gen)
                 self._start_silence_timer()
 
         elif "CORRECTION_YESTERDAY" in intent:
+            self._dbg("confirm.branch_correction_yesterday", intent=intent)
             is_add = intent.endswith("_ADD")
             await self._apply_correction("yesterday", text, gen, is_add)
         elif "CORRECTION_TODAY" in intent:
+            self._dbg("confirm.branch_correction_today", intent=intent)
             is_add = intent.endswith("_ADD")
             await self._apply_correction("today", text, gen, is_add)
         elif "CORRECTION_BLOCKER" in intent:
+            self._dbg("confirm.branch_correction_blockers", intent=intent)
             is_add = intent.endswith("_ADD")
             await self._apply_correction("blockers", text, gen, is_add)
         else:
+            self._dbg("confirm.branch_fallback_unclear_prompt")
             r = "Sure, go ahead. What would you like to update?"
             self._add_history("Sam", r)
             await self.speak(r, "standup-unclear", gen)
@@ -1606,12 +1950,14 @@ class StandupFlow:
     async def background_finalize(self):
         """Called AFTER bot leaves. Smart-fetches relevant tickets, extracts data, creates subtasks.
         Creates fresh JiraClient since session's client gets closed during cleanup."""
+        self._dbg("background_finalize.entry")
 
         print(f"[Standup] 🔧 Background: extracting structured data...")
         t0 = time.time()
 
         # Prepare variables — use clean Groq summary if available
         if self._confirmed_summary:
+            self._dbg("background_finalize.use_confirmed_summary")
             clean = self._confirmed_summary
             print(f"[Standup] 📋 Using clean summary for extraction: {clean[:80]}")
             yesterday_for_extraction = self.data["yesterday"]["raw"]
@@ -1640,10 +1986,17 @@ class StandupFlow:
                 blockers_for_extraction = b_match.group(1).strip().rstrip(".")
                 print(f"[Standup] 📋 Clean blockers: {blockers_for_extraction}")
         else:
+            self._dbg("background_finalize.use_raw_data")
             yesterday_for_extraction = self.data["yesterday"]["raw"]
             today_for_extraction = self.data["today"]["raw"]
             blockers_for_extraction = self.data["blockers"]["raw"] or "No blockers"
 
+        self._dbg(
+            "background_finalize.extraction_inputs",
+            yesterday=yesterday_for_extraction[:60],
+            today=today_for_extraction[:60],
+            blockers=blockers_for_extraction[:60],
+        )
         # ── Smart fetch: build targeted ticket context ──
         # Only search with yesterday + today text (blockers describe problems, not tickets)
         search_raw = f"{self.data['yesterday']['raw']} {self.data['today']['raw']}"
@@ -2229,16 +2582,20 @@ class StandupFlow:
     # ── Silence timer ─────────────────────────────────────────────────────────
 
     def _start_silence_timer(self):
+        self._dbg("_start_silence_timer")
         self._cancel_silence_timer()
         self._silence_task = asyncio.create_task(self._silence_reprompt())
 
     def _cancel_silence_timer(self):
         if self._silence_task and not self._silence_task.done():
+            self._dbg("_cancel_silence_timer")
             self._silence_task.cancel()
 
     async def _silence_reprompt(self):
+        self._dbg("_silence_reprompt.entry", state=self.state.name)
         try:
             await asyncio.sleep(10.0)
+            self._dbg("_silence_reprompt.wake", state=self.state.name)
             prompts = {
                 StandupState.ASK_YESTERDAY: "Still there? What did you work on yesterday?",
                 StandupState.ASK_TODAY: "What's your plan for today?",
@@ -2247,12 +2604,13 @@ class StandupFlow:
             }
             prompt = prompts.get(self.state)
             if prompt:
-                # Skip re-prompt if new text already arrived (user started speaking)
+                self._dbg("_silence_reprompt.will_speak", prompt=prompt[:60])
                 if (
                     hasattr(self, "_check_buffer_fn")
                     and self._check_buffer_fn
                     and self._check_buffer_fn()
                 ):
+                    self._dbg("_silence_reprompt.skip_user_speaking")
                     print(f"[Standup] ⏰ Skipped re-prompt — user already speaking")
                     # IMPORTANT: restart timer anyway, in case the detection was stale data.
                     # If user really is speaking, their transcript will process and cancel this timer.
@@ -2267,10 +2625,13 @@ class StandupFlow:
                 finally:
                     self._playing_reprompt = False
                 self._start_silence_timer()
+            else:
+                self._dbg("_silence_reprompt.no_prompt_for_state")
         except asyncio.CancelledError:
-            pass
+            self._dbg("_silence_reprompt.cancelled")
 
     def get_result(self) -> dict:
+        self._dbg("get_result")
         return {
             "developer": self.data["developer"],
             "date": self.data["date"],
@@ -2303,3 +2664,16 @@ class StandupFlow:
             "one_line_summary": self.data.get("one_line_summary", ""),
             "has_real_blocker": self.data.get("has_real_blocker", False),
         }
+
+
+_install_standup_tracing(StandupFlow)
+if _STANDUP_DEBUG:
+    print(
+        "[Standup][DBG] Method tracing ON (STANDUP_DEBUG=1). "
+        "Set STANDUP_DEBUG=0 to disable."
+    )
+if _STANDUP_DEBUG_LINES:
+    print(
+        "[Standup][DBG] Per-line tracing ON (STANDUP_DEBUG_LINES=1) "
+        "for hot paths: handle, warm_up, question, confirm, summary, background."
+    )

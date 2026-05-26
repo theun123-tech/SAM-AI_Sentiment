@@ -18,7 +18,7 @@ import aiohttp
 from collections import deque
 
 from Trigger import TriggerDetector
-from Agent import PMAgent, FILLERS
+from Agent import PMAgent, FILLERS, _GEMINI_AVAILABLE
 from Speaker import CartesiaSpeaker, _mix_noise, get_duration_ms
 from stt import RmsVAD
 from external_apis import (
@@ -122,6 +122,84 @@ PRELOAD_MAX_LARGE = 100  # Cap for large projects (sprint + priority + recent)
 
 def ts():
     return time.strftime("%H:%M:%S")
+
+
+_HONORIFIC_RE = _re.compile(
+    r"^(?:dr|mr|mrs|ms|miss|prof|professor|sir|madam|ma'am)\.?\s+",
+    _re.IGNORECASE,
+)
+_NAME_CHANGE_RE = _re.compile(
+    r"(?:call me|my name is|actually it'?s|people call me|you can call me)\s+(\w+)",
+    _re.IGNORECASE,
+)
+_CASUAL_NAME_WORDS = frozenset(
+    {
+        "boss",
+        "buddy",
+        "mate",
+        "chief",
+        "dude",
+        "bro",
+        "sis",
+        "pal",
+        "friend",
+        "matey",
+        "captain",
+        "sir",
+        "ma'am",
+        "madam",
+    }
+)
+_NAME_CHANGE_CONFIRMATIONS = [
+    "Got it, {name} — noted.",
+    "{name}, got it — I'll use that.",
+]
+
+
+def _extract_first_name(name: str) -> str:
+    """Strip honorifics and return capitalized first name. 'Dr. Rahul Mehta' → 'Rahul'."""
+    if not name or name in ("", "Unknown"):
+        return name or ""
+    cleaned = _HONORIFIC_RE.sub("", name.strip())
+    parts = cleaned.split()
+    if not parts:
+        return name.strip()
+    return parts[0].capitalize()
+
+
+def _greeting_time_slot() -> str:
+    hour = time.localtime().tm_hour
+    if 5 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 17:
+        return "afternoon"
+    if 17 <= hour < 21:
+        return "evening"
+    return "late"
+
+
+_CLIENT_GREETING_OPENERS = {
+    "morning": [
+        "Good morning, {first}. Good to have you.",
+        "Morning, {first}. Glad you're here.",
+        "Hey {first}, good morning — good to have you.",
+    ],
+    "afternoon": [
+        "Good afternoon, {first}. Good to have you.",
+        "Afternoon, {first}. Glad you're here.",
+        "Hey {first}, good afternoon — good to have you.",
+    ],
+    "evening": [
+        "Good evening, {first}. Good to have you.",
+        "Evening, {first}. Glad you're here.",
+        "Hey {first}, good evening — good to have you.",
+    ],
+    "late": [
+        "Hey {first}. Good to have you.",
+        "Hi {first}. Glad you're here.",
+        "Hey {first} — good to have you on the line.",
+    ],
+}
 
 
 def elapsed(since: float) -> str:
@@ -934,6 +1012,9 @@ class BotSession:
         self._client_silence_task: asyncio.Task | None = None
         self._client_reprompt_count = 0
         self._user_left = False
+        self._session_closed = False
+        self._active_name: str = ""
+        self._last_greeting_variation = -1
         self._last_sam_intent: str | None = (
             None  # "question", "creation", "greeting", "completion", "answer", "general"
         )
@@ -955,6 +1036,7 @@ class BotSession:
         self._flux_audio_buf = b""  # Re-chunk buffer for 80ms chunks (2560 bytes)
         _FLUX_CHUNK_SIZE = 2560  # 80ms at 16kHz S16LE (recommended by Deepgram)
         self._FLUX_CHUNK_SIZE = _FLUX_CHUNK_SIZE
+        self._flux_standup_audio_logged = False  # log first routed chunk once
 
         # Flux speech_off debounce — Recall's participant_events.speech_off signals
         # user stopped speaking. We convert the current Flux interim text to FINAL
@@ -1419,6 +1501,8 @@ class BotSession:
         return "Project tickets: " + "; ".join(parts)
 
     async def cleanup(self):
+        self._session_closed = True
+        self._cancel_client_silence_timer()
         if self.current_task and not self.current_task.done():
             self.current_task.cancel()
         if self.eot_task and not self.eot_task.done():
@@ -2292,8 +2376,8 @@ class BotSession:
             await asyncio.sleep(30.0)
 
             # Guards before reprompting
-            if self._user_left:
-                return  # user left the meeting
+            if self._session_closed or self._user_left:
+                return
             if self._client_reprompt_count >= 2:
                 # Play a recovery message instead of going silent
                 _first = (self.username or "").split()[0] if self.username else "there"
@@ -2628,7 +2712,7 @@ class BotSession:
                     .get("participant", {})
                     .get("name", "")
                 )
-                if speaker_name == self.standup_flow.developer:
+                if _extract_first_name(speaker_name) == self.standup_flow.developer:
                     # Cancel any existing debounce (rare — back-to-back speech_off)
                     if (
                         self._flux_speech_off_task
@@ -2702,31 +2786,41 @@ class BotSession:
                     pass
 
         elif event == "audio_separate_raw.data":
-            # ── Standup mode: existing single-Flux path (UNCHANGED) ─────
+            # ── Standup mode: existing single-Flux path ─────
             if self._flux_enabled and self._stt_queue:
                 inner = payload.get("data", {}).get("data", {})
                 participant = inner.get("participant", {}).get("name", "")
+                # Match on first name — standup uses the developer's first name
+                # ("Piyush") but Recall.ai reports the full name from Google Meet
+                # ("Piyush Sharma"). Without this normalization, audio is never
+                # routed to Flux and the standup hangs.
+                participant_first = _extract_first_name(participant) if participant else ""
                 if (
                     participant
                     and self.standup_flow
-                    and participant == self.standup_flow.developer
+                    and participant_first == self.standup_flow.developer
                 ):
                     audio_b64 = inner.get("buffer", "")
                     if audio_b64:
                         try:
                             pcm = base64.b64decode(audio_b64)
+                            if not self._flux_standup_audio_logged:
+                                self._flux_standup_audio_logged = True
+                                print(
+                                    f"[{ts()}] {self.tag} 🎯 Flux standup audio routing ON "
+                                    f"({participant_first}, {len(pcm)} bytes/chunk)"
+                                )
                             self._flux_audio_buf += pcm
-                            # Send 80ms chunks (2560 bytes) — Flux recommended size
-                            # IMPORTANT: Send ALL audio including silence — Flux needs
-                            # to hear silence to detect EndOfTurn via its internal VAD.
                             while len(self._flux_audio_buf) >= self._FLUX_CHUNK_SIZE:
                                 chunk = self._flux_audio_buf[: self._FLUX_CHUNK_SIZE]
                                 self._flux_audio_buf = self._flux_audio_buf[
                                     self._FLUX_CHUNK_SIZE :
                                 ]
                                 await self._stt_queue.put(chunk)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(
+                                f"[{ts()}] {self.tag} ⚠️  Flux standup audio route failed: {e}"
+                            )
 
             # ── Client mode: route to per-speaker Flux manager ──────────
             elif self._per_speaker_flux_active:
@@ -2758,6 +2852,7 @@ class BotSession:
             )
             if name and name.lower() != "sam":
                 print(f"[{ts()}] {self.tag} 👋 {name} joined")
+                self._active_name = _extract_first_name(name)
                 # User is back (or new user joined) — reprompts should work again
                 self._user_left = False
                 # Feature 4 Memory: record attendee + start lock task on first join.
@@ -3109,6 +3204,9 @@ class BotSession:
                 f"transcript arrived {latency_ms:.0f}ms after audio stopped"
             )
             self.partial_text = ""
+
+        if await self._maybe_handle_name_change(text):
+            return
 
         # Hand off to AddresseeDecider — it will wait 1s of silence then decide
         if self._addressee_decider:
@@ -4511,13 +4609,81 @@ class BotSession:
 
         return all_sentences, False  # completed normally
 
+    def _check_name_change(self, text: str) -> str | None:
+        """Return extracted preferred name if user is renaming themselves."""
+        m = _NAME_CHANGE_RE.search(text or "")
+        if not m:
+            return None
+        return _extract_first_name(m.group(1))
+
+    async def _maybe_handle_name_change(self, text: str) -> bool:
+        """Detect name change, confirm, and return True if handled."""
+        new_name = self._check_name_change(text)
+        if not new_name:
+            return False
+        await self._handle_name_change(new_name)
+        return True
+
+    async def _handle_name_change(self, new_name: str) -> None:
+        first = _extract_first_name(new_name)
+        if first.lower() in _CASUAL_NAME_WORDS:
+            msg = "I'll need your actual first name — what should I call you?"
+            print(f"[{ts()}] {self.tag} 📝 Name change rejected (casual): {first}")
+            self._log_sam(msg)
+            self.speaking = True
+            try:
+                await self._speak(msg, "name-change-reject", self.generation)
+            finally:
+                self.speaking = False
+                self.audio_playing = False
+            return
+
+        previous = self._active_name
+        self._active_name = first
+        if self.standup_flow and not self.standup_flow.is_done:
+            self.standup_flow.developer = first
+
+        msg = random.choice(_NAME_CHANGE_CONFIRMATIONS).format(name=first)
+        print(
+            f"[{ts()}] {self.tag} 📝 Name change: {previous or '?'} → {first}"
+        )
+        self._log_sam(msg)
+        try:
+            from datetime import datetime as _dt
+
+            self._utterance_log.append(
+                {
+                    "timestamp": _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "event": "name_change",
+                    "previous_name": previous,
+                    "session_name": first,
+                    "changed_at": _dt.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            )
+        except Exception:
+            pass
+
+        self.speaking = True
+        try:
+            await self._speak(msg, "name-change", self.generation)
+        finally:
+            self.speaking = False
+            self.audio_playing = False
+
     def _build_greeting(self, name: str) -> str:
         """Phase 3.5: greeting that announces agenda if setup was provided.
 
         Falls back to the original greeting if no agenda is configured.
         """
-        first = name.split()[0] if name and name not in ("", "Unknown") else name
-        base = f"Hey {first}. Good to have you."
+        first = self._active_name or _extract_first_name(name)
+        if not first or first == "Unknown":
+            first = name.split()[0] if name and name not in ("", "Unknown") else "there"
+        slot = _greeting_time_slot()
+        openers = _CLIENT_GREETING_OPENERS[slot]
+        self._last_greeting_variation = (
+            self._last_greeting_variation + 1
+        ) % len(openers)
+        base = openers[self._last_greeting_variation].format(first=first)
         setup = self._meeting_setup or {}
         raw_agenda = setup.get("agenda") or []
         titles: list[str] = []
@@ -4535,12 +4701,12 @@ class BotSession:
         n = len(titles)
         if n == 1:
             return (
-                f"Hey {first}. One thing on the agenda today — "
+                f"{base} One thing on the agenda today — "
                 f"{titles[0]}. Ready when you are."
             )
         if n == 2:
             return (
-                f"Hey {first}. Two things today — "
+                f"{base} Two things today — "
                 f"{titles[0]} and {titles[1]}. "
                 f"Want to start with the first?"
             )
@@ -4548,7 +4714,7 @@ class BotSession:
         # greeting length from ~17s to ~6s. Remaining topics come up
         # naturally as the meeting flows.
         return (
-            f"Hey {first}. {n} topics today — starting with {titles[0]}. "
+            f"{base} {n} topics today — starting with {titles[0]}. "
             f"Ready when you are."
         )
 
@@ -4578,7 +4744,10 @@ class BotSession:
         await asyncio.sleep(1.0)
         if self.speaking:
             return
-        print(f"[{ts()}] {self.tag} 📋 Starting standup for {developer_name}")
+        dev_first = self._active_name or _extract_first_name(developer_name)
+        if not self._active_name:
+            self._active_name = dev_first
+        print(f"[{ts()}] {self.tag} 📋 Starting standup for {dev_first}")
 
         # Create standup flow with speaker function
         async def speak_fn(text, label, gen):
@@ -4615,7 +4784,7 @@ class BotSession:
                 return await self._speak(text, label, gen)
 
         self.standup_flow = StandupFlow(
-            developer_name=developer_name,
+            developer_name=dev_first,
             agent=self.agent,
             speaker_fn=speak_fn,
             jira_client=self.jira if self.jira.enabled else None,
@@ -4642,7 +4811,7 @@ class BotSession:
 
         # Start Flux STT if Deepgram key available
         if DEEPGRAM_API_KEY and not self._stt_task:
-            await self._start_flux_stt(developer_name)
+            await self._start_flux_stt(dev_first)
 
     # ── Flux STT (own Deepgram for standup) ──────────────────────────────────
 
@@ -4901,6 +5070,7 @@ class BotSession:
         self._flux_enabled = False
         self._flux_audio_buf = b""
         self._flux_last_interim_text = ""
+        self._flux_standup_audio_logged = False
 
     async def _flux_debounce_finalize(self):
         """Wait for debounce window, then convert Flux's pending interim text to FINAL.
@@ -5006,6 +5176,16 @@ class BotSession:
         full_text = _convert_spoken_ticket_refs(full_text, project_key)
 
         print(f"[{ts()}] {self.tag} 📋 Standup input: {full_text[:80]}")
+
+        changed_name = self._check_name_change(full_text)
+        if changed_name:
+            self.generation += 1
+            self.speaking = True
+            try:
+                await self._handle_name_change(changed_name)
+            finally:
+                self.speaking = False
+            return
 
         # Clear any stale interrupt
         self.interrupt_event.clear()
@@ -5194,6 +5374,16 @@ class BotSession:
 
             print(f"[{ts()}] {self.tag} 📋 Standup input: {full_text[:80]}")
 
+            changed_name = self._check_name_change(full_text)
+            if changed_name:
+                self.generation += 1
+                self.speaking = True
+                try:
+                    await self._handle_name_change(changed_name)
+                finally:
+                    self.speaking = False
+                return
+
             # Clear any stale interrupt
             self.interrupt_event.clear()
 
@@ -5285,6 +5475,10 @@ class BotSession:
         adaptive_endpointing_used: Optional[str] = None,
         active_listening_token_played: Optional[str] = None,
         bridge_filler_played: Optional[str] = None,
+        llm_used: Optional[str] = None,
+        llm_model: Optional[str] = None,
+        fallback_triggered: bool = False,
+        groq_cooling: bool = False,
     ) -> None:
         """Build and persist one per-utterance insight record.
 
@@ -5317,6 +5511,10 @@ class BotSession:
                 "adaptive_endpointing_used": adaptive_endpointing_used,
                 "active_listening_token_played": active_listening_token_played,
                 "bridge_filler_played": bridge_filler_played,
+                "llm_used": llm_used,
+                "llm_model": llm_model,
+                "fallback_triggered": fallback_triggered,
+                "groq_cooling": groq_cooling,
             }
 
             self._utterance_log.append(record)
@@ -6724,7 +6922,7 @@ class BotSession:
             return None
 
         t0 = _t.time()
-        _is_gemini = self.mode == "client_call"
+        _is_gemini = self.mode == "client_call" and _GEMINI_AVAILABLE
         print(
             f"[{ts()}] {self.tag} fast-PM-journal "
             f"llm_used={'gemini' if _is_gemini else 'groq'} session_type={self.mode}"
@@ -7004,7 +7202,7 @@ class BotSession:
 
         # ── Open LLM stream (Gemini for client_call, Groq for standup) ──
         t0 = _t.time()
-        _is_gemini = self.mode == "client_call"
+        _is_gemini = self.mode == "client_call" and _GEMINI_AVAILABLE
         print(
             f"[{ts()}] {self.tag} fast-PM-cache "
             f"llm_used={'gemini' if _is_gemini else 'groq'} session_type={self.mode}"

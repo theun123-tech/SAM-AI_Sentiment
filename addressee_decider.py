@@ -31,13 +31,23 @@ from enum import Enum
 from typing import Awaitable, Callable, Optional
 
 from openai import AsyncOpenAI
+
 # Shared Groq rotator (from Fix B) — falls back to single-key if not available
 try:
     from groq_client import get_shared_groq_rotator
+
     _ROTATOR_AVAILABLE = True
 except ImportError:
     get_shared_groq_rotator = None
     _ROTATOR_AVAILABLE = False
+
+try:
+    import google.generativeai as _genai
+
+    _GEMINI_AVAILABLE = True
+except ImportError:
+    _genai = None
+    _GEMINI_AVAILABLE = False
 
 
 # Silence window before firing LLM decision
@@ -67,6 +77,7 @@ class DeciderState(Enum):
 @dataclass
 class CompletedTurn:
     """One speaker's finished utterance awaiting a response decision."""
+
     speaker: str
     text: str
     completed_at: float = field(default_factory=time.time)
@@ -75,10 +86,11 @@ class CompletedTurn:
 @dataclass
 class Decision:
     """What the LLM decided — passed to BotSession for action."""
-    type: str                      # "respond_to" | "respond_both" | "none"
-    speakers: list[str]            # which speaker(s) Sam should address
-    text: str                      # combined utterance text for Sam to respond to
-    reasoning: str = ""            # LLM's reasoning (for logging)
+
+    type: str  # "respond_to" | "respond_both" | "none"
+    speakers: list[str]  # which speaker(s) Sam should address
+    text: str  # combined utterance text for Sam to respond to
+    reasoning: str = ""  # LLM's reasoning (for logging)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -127,17 +139,20 @@ Examples:
 # Context provider type — BotSession provides this
 # ══════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class ContextBundle:
     """Data the BotSession provides when AddresseeDecider asks for context."""
-    participants: list[str]        # current meeting participants
-    sam_last_response: str         # most recent thing Sam said (empty if none)
+
+    participants: list[str]  # current meeting participants
+    sam_last_response: str  # most recent thing Sam said (empty if none)
     conversation_history: list[str]  # formatted "Speaker: text" strings, oldest first
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # AddresseeDecider — the main class
 # ══════════════════════════════════════════════════════════════════════════
+
 
 class AddresseeDecider:
     """Decides who Sam should respond to in multi-party meetings.
@@ -194,8 +209,9 @@ class AddresseeDecider:
                     # Rotator has no keys — fall back to legacy single-key mode
                     self._rotator = None
             except Exception as e:
-                print(f"[Addressee] {tag} ⚠️  Rotator init failed, "
-                      f"using single key: {e}")
+                print(
+                    f"[Addressee] {tag} ⚠️  Rotator init failed, using single key: {e}"
+                )
                 self._rotator = None
 
         if self._rotator is None:
@@ -204,16 +220,31 @@ class AddresseeDecider:
                 api_key=groq_api_key,
                 base_url="https://api.groq.com/openai/v1",
             )
-            print(f"[Addressee] {tag} ℹ️  Using single Groq key "
-                  f"(rotator not available)")
+            print(f"[Addressee] {tag} ℹ️  Using single Groq key (rotator not available)")
         else:
-            print(f"[Addressee] {tag} ✅ Using shared Groq rotator "
-                  f"({self._rotator.get_key_count()} keys)")
+            print(
+                f"[Addressee] {tag} ✅ Using shared Groq rotator "
+                f"({self._rotator.get_key_count()} keys)"
+            )
 
         self._get_context = get_context
         self._on_decision = on_decision
         self._tag = tag
         self._model = model
+
+        # Gemini fallback — used when all Groq keys are cooling down
+        self._gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        self._gemini_available = _GEMINI_AVAILABLE and bool(self._gemini_key)
+        self._last_provider = "groq"
+        if self._gemini_available:
+            print(f"[Addressee] {tag} Gemini fallback: gemini-2.5-flash ✅")
+        else:
+            reason = (
+                "key missing"
+                if _GEMINI_AVAILABLE
+                else "google-generativeai not installed"
+            )
+            print(f"[Addressee] {tag} ⚠️  Gemini fallback unavailable ({reason})")
 
         # State
         self._state: DeciderState = DeciderState.LISTENING
@@ -308,7 +339,8 @@ class AddresseeDecider:
             "sam_speaking": self._sam_speaking,
             "last_activity_age_ms": (
                 int((time.time() - self._last_activity_at) * 1000)
-                if self._last_activity_at else 0
+                if self._last_activity_at
+                else 0
             ),
         }
 
@@ -330,9 +362,7 @@ class AddresseeDecider:
             self._state = DeciderState.SILENCE_WAITING
 
         # Start fresh 1s silence timer
-        self._silence_timer_task = asyncio.create_task(
-            self._silence_timer_coroutine()
-        )
+        self._silence_timer_task = asyncio.create_task(self._silence_timer_coroutine())
 
     def _cancel_silence_timer(self) -> None:
         if self._silence_timer_task and not self._silence_timer_task.done():
@@ -366,8 +396,10 @@ class AddresseeDecider:
             if self._first_activity_at > 0:
                 window_age = time.time() - self._first_activity_at
                 if window_age > MAX_SILENCE_WAIT_SECONDS:
-                    print(f"[Addressee] {self._tag} ⚠️  Max wait exceeded "
-                          f"({window_age:.1f}s) — forcing decision")
+                    print(
+                        f"[Addressee] {self._tag} ⚠️  Max wait exceeded "
+                        f"({window_age:.1f}s) — forcing decision"
+                    )
 
             # Fire the LLM decision
             await self._fire_decision()
@@ -405,28 +437,26 @@ class AddresseeDecider:
         # Avoids the 1500-2000ms LLM call on unambiguous utterances.
         fast_decision = self._try_fast_path(turns)
         if fast_decision is not None:
-            print(f"[Addressee] {self._tag} ⚡ Fast-path: "
-                  f"{fast_decision.reasoning} (skipped LLM)")
+            print(
+                f"[Addressee] {self._tag} ⚡ Fast-path: "
+                f"{fast_decision.reasoning} (skipped LLM)"
+            )
             try:
                 await self._on_decision(fast_decision)
             except Exception as e:
-                print(f"[Addressee] {self._tag} ⚠️  on_decision callback "
-                      f"failed: {e}")
+                print(f"[Addressee] {self._tag} ⚠️  on_decision callback failed: {e}")
             self._state = DeciderState.LISTENING
             return
         # ── End fast-path ──
 
         # Launch LLM call as a cancellable task
-        self._llm_task = asyncio.create_task(
-            self._run_llm_decision(turns, context)
-        )
+        self._llm_task = asyncio.create_task(self._run_llm_decision(turns, context))
 
         try:
             decision = await self._llm_task
         except asyncio.CancelledError:
             # New speech arrived during LLM call — abandon this decision
-            print(f"[Addressee] {self._tag} 🚫 Decision cancelled "
-                  f"(new speech arrived)")
+            print(f"[Addressee] {self._tag} 🚫 Decision cancelled (new speech arrived)")
             # Put turns back at the front of the buffer so we don't lose them
             self._turn_buffer = turns + self._turn_buffer
             return
@@ -469,6 +499,7 @@ class AddresseeDecider:
             return None
 
         import re as _re
+
         # Word-boundary match for "Sam" (case-insensitive). Followed by
         # non-letter ensures we do not match Samir, Samantha, Sammy, etc.
         sam_pattern = _re.compile(r"\b[Ss]am\b", _re.IGNORECASE)
@@ -533,11 +564,20 @@ class AddresseeDecider:
             for attempt in range(max_attempts):
                 key_info = await self._rotator.get_next_key()
                 if key_info is None:
-                    print(f"[Addressee] {self._tag} ⚠️  All Groq keys "
-                          f"cooling down — defaulting to 'none'")
+                    print(
+                        f"[Addressee] {self._tag} ⚠️  Groq cooling — switching to Gemini 2.5 Flash"
+                    )
+                    decision = await self._run_gemini_decision(prompt, turns)
+                    if decision is not None:
+                        return decision
+                    print(
+                        f"[Addressee] {self._tag} ❌ Both Groq and Gemini unavailable — staying silent"
+                    )
                     return Decision(
-                        type="none", speakers=[], text="",
-                        reasoning="all_keys_rate_limited",
+                        type="none",
+                        speakers=[],
+                        text="",
+                        reasoning="all_providers_failed",
                     )
                 key, label = key_info
                 client = self._get_client_for_key(key)
@@ -553,12 +593,21 @@ class AddresseeDecider:
                         timeout=LLM_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
-                    print(f"[Addressee] {self._tag} ⏱️  LLM timeout "
-                          f"on {label} — defaulting to 'none'")
+                    print(
+                        f"[Addressee] {self._tag} ⏱️  Groq timeout on {label} — switching to Gemini 2.5 Flash"
+                    )
                     await self._rotator.mark_error(key)
+                    decision = await self._run_gemini_decision(prompt, turns)
+                    if decision is not None:
+                        return decision
+                    print(
+                        f"[Addressee] {self._tag} ❌ Both Groq and Gemini unavailable — staying silent"
+                    )
                     return Decision(
-                        type="none", speakers=[], text="",
-                        reasoning="llm_timeout",
+                        type="none",
+                        speakers=[],
+                        text="",
+                        reasoning="all_providers_failed",
                     )
                 except asyncio.CancelledError:
                     raise
@@ -568,20 +617,30 @@ class AddresseeDecider:
                         # Rate-limited on this key — try next
                         await self._rotator.mark_rate_limited(key)
                         continue
-                    print(f"[Addressee] {self._tag} ⚠️  LLM error "
-                          f"on {label}: {e}")
+                    print(f"[Addressee] {self._tag} ⚠️  LLM error on {label}: {e}")
                     await self._rotator.mark_error(key)
                     return None
                 # Success — mark key good, break out to parse response
                 await self._rotator.mark_success(key)
+                if self._last_provider == "gemini":
+                    print(
+                        f"[Addressee] {self._tag} ✅ Groq recovered — switching back from Gemini"
+                    )
+                self._last_provider = "groq"
                 break
             else:
                 # Exhausted all keys with 429s
-                print(f"[Addressee] {self._tag} ⚠️  Exhausted "
-                      f"{max_attempts} key(s) with rate limits")
+                print(
+                    f"[Addressee] {self._tag} ⚠️  Groq exhausted {max_attempts} key(s) — switching to Gemini 2.5 Flash"
+                )
+                decision = await self._run_gemini_decision(prompt, turns)
+                if decision is not None:
+                    return decision
+                print(
+                    f"[Addressee] {self._tag} ❌ Both Groq and Gemini unavailable — staying silent"
+                )
                 return Decision(
-                    type="none", speakers=[], text="",
-                    reasoning="all_keys_rate_limited",
+                    type="none", speakers=[], text="", reasoning="all_providers_failed"
                 )
 
         # ── Single-key path (legacy fallback) ──
@@ -598,13 +657,17 @@ class AddresseeDecider:
                     timeout=LLM_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
-                print(f"[Addressee] {self._tag} ⏱️  LLM timeout — "
-                      f"defaulting to 'none'")
+                print(
+                    f"[Addressee] {self._tag} ⏱️  Groq timeout (single-key) — switching to Gemini 2.5 Flash"
+                )
+                decision = await self._run_gemini_decision(prompt, turns)
+                if decision is not None:
+                    return decision
+                print(
+                    f"[Addressee] {self._tag} ❌ Both Groq and Gemini unavailable — staying silent"
+                )
                 return Decision(
-                    type="none",
-                    speakers=[],
-                    text="",
-                    reasoning="llm_timeout",
+                    type="none", speakers=[], text="", reasoning="all_providers_failed"
                 )
             except asyncio.CancelledError:
                 raise
@@ -617,8 +680,7 @@ class AddresseeDecider:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            print(f"[Addressee] {self._tag} ⚠️  LLM returned invalid JSON: "
-                  f"{raw[:100]}")
+            print(f"[Addressee] {self._tag} ⚠️  LLM returned invalid JSON: {raw[:100]}")
             # Fallback: default to first speaker
             return Decision(
                 type="respond_to",
@@ -660,16 +722,103 @@ class AddresseeDecider:
 
         # Log the decision
         if decision.type == "none":
-            print(f"[Addressee] {self._tag} 🤐 LLM: stay silent "
-                  f"({decision.reasoning[:60]})")
+            print(
+                f"[Addressee] {self._tag} 🤐 LLM: stay silent "
+                f"({decision.reasoning[:60]})"
+            )
         elif decision.type == "respond_both":
-            print(f"[Addressee] {self._tag} 👥 LLM: respond to both "
-                  f"{decision.speakers} ({decision.reasoning[:60]})")
+            print(
+                f"[Addressee] {self._tag} 👥 LLM: respond to both "
+                f"{decision.speakers} ({decision.reasoning[:60]})"
+            )
         else:
-            print(f"[Addressee] {self._tag} 🎯 LLM: respond to "
-                  f"{decision.speakers} ({decision.reasoning[:60]})")
+            print(
+                f"[Addressee] {self._tag} 🎯 LLM: respond to "
+                f"{decision.speakers} ({decision.reasoning[:60]})"
+            )
 
         return decision
+
+    async def _run_gemini_decision(
+        self,
+        prompt: str,
+        turns: list,
+    ) -> Optional[Decision]:
+        """Gemini 2.5 Flash fallback when all Groq keys are cooling or timed out.
+
+        Uses the same JSON prompt as the Groq path and parses the response
+        identically. Retries once after 3s on 429/quota errors. Returns None
+        if Gemini is unavailable or fails — caller logs and returns type='none'.
+        """
+        if not self._gemini_available:
+            return None
+        _genai.configure(api_key=self._gemini_key)
+        model = _genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            system_instruction="Return JSON only. No markdown fences, no explanation.",
+        )
+        for attempt in range(2):
+            try:
+                t0 = time.time()
+                resp = await model.generate_content_async(
+                    prompt,
+                    generation_config=_genai.GenerationConfig(
+                        max_output_tokens=150,
+                        temperature=0,
+                    ),
+                )
+                elapsed = int((time.time() - t0) * 1000)
+                raw = (resp.text or "").strip()
+                # Strip markdown code fence if model wraps output anyway
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.strip()
+                data = json.loads(raw)
+                print(f"[Addressee] {self._tag} ✅ Gemini responded in {elapsed}ms")
+                self._last_provider = "gemini"
+                decision_type = data.get("decision", "none")
+                speakers = data.get("speakers", [])
+                reasoning = data.get("reasoning", "gemini_fallback")
+                # Build text the same way as the Groq path
+                if decision_type == "respond_to" and speakers:
+                    target = speakers[0]
+                    matching = [t.text for t in turns if t.speaker == target]
+                    text = (
+                        " ".join(matching)
+                        if matching
+                        else (turns[-1].text if turns else "")
+                    )
+                elif decision_type == "respond_both" and len(speakers) >= 2:
+                    parts = []
+                    for s in speakers:
+                        matching = [t.text for t in turns if t.speaker == s]
+                        if matching:
+                            parts.append(f"{s}: {' '.join(matching)}")
+                    text = "; ".join(parts)
+                else:
+                    text = ""
+                return Decision(
+                    type=decision_type,
+                    speakers=speakers,
+                    text=text,
+                    reasoning=reasoning,
+                )
+            except json.JSONDecodeError:
+                print(f"[Addressee] {self._tag} ⚠️  Gemini returned invalid JSON")
+                return None
+            except Exception as e:
+                err = str(e).lower()
+                if (
+                    "429" in err or "quota" in err or "resource_exhausted" in err
+                ) and attempt == 0:
+                    print(f"[Addressee] {self._tag} ⚠️  Gemini 429 — retrying after 3s")
+                    await asyncio.sleep(3.0)
+                    continue
+                print(f"[Addressee] {self._tag} ❌ Gemini failed: {e}")
+                return None
+        return None
 
     def _build_prompt(
         self,
@@ -677,8 +826,9 @@ class AddresseeDecider:
         context: ContextBundle,
     ) -> str:
         """Assemble the Groq prompt from turns + context."""
-        participants_str = ", ".join(context.participants) if context.participants \
-            else "(unknown)"
+        participants_str = (
+            ", ".join(context.participants) if context.participants else "(unknown)"
+        )
 
         sam_last = context.sam_last_response.strip() or "(none yet)"
         if len(sam_last) > 300:
@@ -689,9 +839,7 @@ class AddresseeDecider:
         else:
             history_str = "(no prior exchanges)"
 
-        utterances_str = "\n".join(
-            f"{t.speaker}: {t.text}" for t in turns
-        )
+        utterances_str = "\n".join(f"{t.speaker}: {t.text}" for t in turns)
 
         return ADDRESSEE_PROMPT.format(
             participants=participants_str,

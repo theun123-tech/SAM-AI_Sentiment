@@ -726,12 +726,13 @@ from typing import List, Optional
 # Fix B: rotating Groq client (shared 12-key pool with Trigger + NLU)
 from groq_client import GroqRotatingClient
 
-try:
-    import google.generativeai as genai  # pip install google-generativeai
+_GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+_GEMINI_AVAILABLE = bool(os.environ.get("GEMINI_API_KEY", "").strip())
 
-    _GEMINI_AVAILABLE = True
-except ImportError:
-    _GEMINI_AVAILABLE = False
+if _GEMINI_AVAILABLE:
+    print(f"[Agent] Gemini ready (OpenAI-compat): {_GEMINI_MODEL} ✅")
+else:
+    print("[Agent] ⚠️  GEMINI_API_KEY missing — client_call uses Groq")
 
 # F8: strip robotic AI opener phrases from the first sentence of every LLM response
 _FILLER_OPENER_RE = re.compile(
@@ -1942,6 +1943,19 @@ class PMAgent:
         # Shares the embed model with self.rag to avoid loading bge twice.
         self.journal = ResearchJournal(embed_model=getattr(self.rag, "_model", None))
 
+        self._gemini_client: AsyncOpenAI | None = None
+
+    def _want_gemini(self) -> bool:
+        return self.session_type == "client_call" and _GEMINI_AVAILABLE
+
+    def _get_gemini_client(self) -> AsyncOpenAI:
+        if self._gemini_client is None:
+            self._gemini_client = AsyncOpenAI(
+                api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            )
+        return self._gemini_client
+
     def start(self):
         """Call once after event loop is running to start background embedder + warmup."""
         self.rag.start_background_embedder()
@@ -1984,44 +1998,28 @@ class PMAgent:
         max_tokens: int,
         temperature: float = 0.7,
     ):
-        """Async generator: stream Gemini tokens for client_call sessions.
+        """Async generator: stream Gemini via OpenAI-compatible API (client_call).
 
-        history uses OpenAI role names (user/assistant); converted to Gemini
-        format (user/model) with content wrapped in parts list.
         429 → retries once after 3s. 401/403 → logs clearly and raises.
         """
         if not _GEMINI_AVAILABLE:
-            raise RuntimeError(
-                "google-generativeai not installed — run: pip install google-generativeai"
-            )
-        gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        if not gemini_key:
             raise RuntimeError("GEMINI_API_KEY not set in .env")
-        genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
-            system_instruction=system_prompt,
-        )
-        contents = [
-            {
-                "role": "user" if m["role"] == "user" else "model",
-                "parts": [m["content"]],
-            }
-            for m in history
-        ]
+        messages = [{"role": "system", "content": system_prompt}] + history
         for attempt in range(2):
             try:
-                response = await model.generate_content_async(
-                    contents,
-                    generation_config=genai.GenerationConfig(
-                        max_output_tokens=max_tokens,
-                        temperature=temperature,
-                    ),
+                stream = await self._get_gemini_client().chat.completions.create(
+                    model=_GEMINI_MODEL,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                     stream=True,
                 )
-                async for chunk in response:
-                    if chunk.text:
-                        yield chunk.text
+                async for chunk in stream:
+                    token = (
+                        chunk.choices[0].delta.content if chunk.choices else None
+                    )
+                    if token:
+                        yield token
                 return
             except Exception as e:
                 err = str(e).lower()
@@ -2948,10 +2946,10 @@ class PMAgent:
 
         try:
             t1 = _t.time()
-            _use_gemini = self.session_type == "client_call"
+            _use_gemini = self._want_gemini()
             if _use_gemini:
                 print(
-                    "[Agent] llm_used=gemini model=gemini-2.0-flash session_type=client_call"
+                    f"[Agent] llm_used=gemini model={_GEMINI_MODEL} session_type=client_call"
                 )
                 _active_stream = self._gemini_stream(
                     system_prompt, self.history, 120, 0.7
@@ -3065,10 +3063,10 @@ class PMAgent:
         if len(self.history) > 6:
             self.history = self.history[-6:]
 
-        _use_gemini = self.session_type == "client_call"
+        _use_gemini = self._want_gemini()
         print(
             f"[Agent] llm_used={'gemini' if _use_gemini else 'groq'} "
-            f"model={'gemini-2.0-flash' if _use_gemini else self.model} "
+            f"model={_GEMINI_MODEL if _use_gemini else self.model} "
             f"session_type={self.session_type}"
         )
         tokens = []
@@ -3879,7 +3877,7 @@ class PMAgent:
         Used by unified_synthesis_to_queue for both the "Azure disabled" and
         the "Azure 5xx/transport error" paths.
         """
-        _use_gemini = self.session_type == "client_call"
+        _use_gemini = self._want_gemini()
         print(
             f"[Agent] synthesis llm_used={'gemini' if _use_gemini else 'groq'} "
             f"session_type={self.session_type}"
